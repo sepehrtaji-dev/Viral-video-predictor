@@ -1,8 +1,12 @@
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.metrics import roc_auc_score, accuracy_score, f1_score
+from sklearn.metrics import (
+    roc_auc_score, accuracy_score, f1_score,
+    precision_recall_curve, classification_report,
+)
 
 from data import load_data
 from model import ViralNet
@@ -41,16 +45,44 @@ def run_epoch(model, loader, loss_fn, opt=None):
     }
 
 
+def collect_probs(model, loader):
+    model.eval()
+    probs, labels = [], []
+    with torch.no_grad():
+        for X, y in loader:
+            X = X.to(DEVICE)
+            probs.append(torch.sigmoid(model(X)).cpu())
+            labels.append(y)
+    return torch.cat(probs).numpy(), torch.cat(labels).numpy()
+
+
+def find_best_threshold(probs: np.ndarray, labels: np.ndarray) -> tuple[float, float, float]:
+    """Returns (best_threshold, best_f1, f1_at_0.5)."""
+    prec, rec, thresh = precision_recall_curve(labels, probs)
+    f1s = 2 * prec * rec / (prec + rec + 1e-8)
+    best_i = int(f1s.argmax())
+    best_thresh = float(thresh[best_i]) if best_i < len(thresh) else 0.5
+
+    # f1 at 0.5 for comparison
+    pred_05 = (probs >= 0.5).astype(int)
+    f1_05 = float(f1_score(labels, pred_05))
+
+    return best_thresh, float(f1s[best_i]), f1_05
+
+
 def main():
     train_dl, val_dl, test_dl, enc = load_data(batch_size=BATCH)
 
     in_dim = next(iter(train_dl))[0].shape[1]
     model = ViralNet(in_dim).to(DEVICE)
-    print(f"device={DEVICE}  in_dim={in_dim}  params={sum(p.numel() for p in model.parameters()):,}")
+    print(f"device={DEVICE}  in_dim={in_dim}  "
+          f"params={sum(p.numel() for p in model.parameters()):,}")
 
     # handle class imbalance
     labels = torch.cat([y for _, y in train_dl])
-    pos_weight = torch.tensor([(labels == 0).sum() / (labels == 1).sum()], device=DEVICE)
+    pos_weight = torch.tensor(
+        [(labels == 0).sum() / (labels == 1).sum()], device=DEVICE
+    )
     loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=EPOCHS)
@@ -68,15 +100,65 @@ def main():
         print(f"ep {epoch:02d} | train loss {tr['loss']:.4f} auc {tr['auc']:.3f} "
               f"| val loss {va['loss']:.4f} auc {va['auc']:.3f} f1 {va['f1']:.3f}{marker}")
 
+    # ---- restore best & find optimal threshold on val ----
     model.load_state_dict(best_state)
-    te = run_epoch(model, test_dl, loss_fn)
-    print(f"\nTEST | loss {te['loss']:.4f} auc {te['auc']:.3f} acc {te['acc']:.3f} f1 {te['f1']:.3f}")
 
+    val_probs, val_labels = collect_probs(model, val_dl)
+    best_thresh, best_f1, f1_05 = find_best_threshold(val_probs, val_labels)
+    print(f"\nthreshold sweep on val:")
+    print(f"  best F1 = {best_f1:.3f} @ threshold = {best_thresh:.3f}")
+    print(f"  F1 @ 0.5 = {f1_05:.3f}")
+
+    # ---- final test eval (at both thresholds) ----
+    test_probs, test_labels = collect_probs(model, test_dl)
+
+    def report(probs, labels, thresh, tag):
+        pred = (probs >= thresh).astype(int)
+        return {
+            "tag": tag,
+            "threshold": thresh,
+            "loss": None,  # computed below
+            "auc": float(roc_auc_score(labels, probs)),
+            "acc": float(accuracy_score(labels, pred)),
+            "f1": float(f1_score(labels, pred)),
+        }
+
+    te_05 = report(test_probs, test_labels, 0.5, "test@0.5")
+    te_best = report(test_probs, test_labels, best_thresh, f"test@{best_thresh:.3f}")
+
+    # compute test loss once
+    model.eval()
+    with torch.no_grad():
+        total, n = 0.0, 0
+        for X, y in test_dl:
+            X, y = X.to(DEVICE), y.to(DEVICE)
+            total += loss_fn(model(X), y).item() * len(y)
+            n += len(y)
+    test_loss = total / n
+
+    print(f"\nTEST loss {test_loss:.4f}")
+    print(f"  @0.5 :        auc {te_05['auc']:.3f}  acc {te_05['acc']:.3f}  f1 {te_05['f1']:.3f}")
+    print(f"  @{best_thresh:.3f}: auc {te_best['auc']:.3f}  acc {te_best['acc']:.3f}  f1 {te_best['f1']:.3f}")
+
+    # classification report at best threshold
+    print(f"\nclassification report (test @ threshold {best_thresh:.3f}):")
+    print(classification_report(
+        test_labels, (test_probs >= best_thresh).astype(int), digits=3
+    ))
+
+    # ---- save ----
     torch.save({
         "model_state": best_state,
         "in_dim": in_dim,
         "encoders": enc,
-        "test_metrics": te,
+        "threshold": best_thresh,
+        "test_metrics": {
+            "loss": test_loss,
+            "auc": te_best["auc"],
+            "acc": te_best["acc"],
+            "f1": te_best["f1"],
+            "threshold": best_thresh,
+        },
     }, CKPT)
     print(f"saved -> {CKPT}")
 

@@ -1,1 +1,5 @@
-data/
+data/processed/
+model.pt
+predictions.csv
+__pycache__/
+checkpoints/
